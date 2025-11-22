@@ -1,3 +1,5 @@
+// src/routes/auth.ts
+
 import { Router, Request, Response } from "express";
 import { OAuth2Client } from "google-auth-library";
 import { config } from "../core/config";
@@ -6,7 +8,15 @@ import { createAccessToken } from "../core/jwt";
 import { authMiddleware } from "../middlewares/authMiddleware";
 
 const router = Router();
+
+// Google OAuth 클라이언트
 const googleClient = new OAuth2Client();
+
+// 허용 가능한 client_id 목록 (웹 + 안드)
+const allowedAudiences = [
+  config.googleWebClientId,
+  config.googleAndroidClientId, // 권장: 추후 iOS도 추가 가능
+];
 
 // POST /api/auth/google
 router.post("/google", async (req: Request, res: Response) => {
@@ -17,30 +27,44 @@ router.post("/google", async (req: Request, res: Response) => {
   }
 
   if (!platform) {
-    return res
-      .status(400)
-      .json({ error: "platform(web|android)이 필요합니다." });
+    return res.status(400).json({ error: "platform(web|android)이 필요합니다." });
   }
 
   try {
-    const audience =
-      platform === "android"
-        ? config.googleAndroidClientId
-        : config.googleWebClientId;
-
+    // --- 🔐 1. Google idToken 검증 ---------------------
     const ticket = await googleClient.verifyIdToken({
       idToken,
-      audience,
+      audience: allowedAudiences, // ★ 웹/앱 둘 다 지원하는 핵심 부분!
     });
 
     const payload = ticket.getPayload();
     if (!payload) throw new Error("Google payload 없음");
 
+    // 기본 필드 추출
     const googleSub = payload.sub;
     const email = payload.email;
     const name = payload.name;
     const avatarUrl = payload.picture;
 
+    // --- 🔐 2. Issuer 확인 (보안 강화) ------------------
+    const validIss = ["https://accounts.google.com", "accounts.google.com"];
+    if (!payload.iss || !validIss.includes(payload.iss)) {
+      throw new Error(`Invalid issuer: ${payload.iss}`);
+    }
+
+    // --- 🔐 3. Audience 정보 확인 -----------------------
+    if (!allowedAudiences.includes(payload.aud!)) {
+      throw new Error(`Unmatched audience: ${payload.aud}`);
+    }
+
+    // --- 🔐 4. Android 앱 검증 (선택: azp 체크) --------
+    if (platform === "android") {
+      if (payload.azp !== config.googleAndroidClientId) {
+        console.warn("Android app azp mismatch:", payload.azp);
+      }
+    }
+
+    // --- 🗄️ 5. 사용자 정보 DB에 upsert --------------------
     const result = await db.query(
       `
       INSERT INTO users (google_sub, email, name, avatar_url, last_login_at)
@@ -57,6 +81,8 @@ router.post("/google", async (req: Request, res: Response) => {
     );
 
     const user = result.rows[0];
+
+    // --- 🔑 6. Access Token 발급 ------------------------
     const accessToken = createAccessToken(user.id);
 
     return res.json({
@@ -69,16 +95,20 @@ router.post("/google", async (req: Request, res: Response) => {
       accessToken,
       expiresIn: 3600,
     });
-  } catch (err) {
-    console.error("Google Login Error:", err);
-    return res.status(401).json({ error: "Invalid Google idToken" });
+  } catch (err: any) {
+    console.error("❌ Google Login Error:", err?.message || err);
+
+    return res.status(401).json({
+      error: "Invalid Google idToken",
+      detail: err?.message,
+    });
   }
 });
 
 // GET /api/auth/me
 router.get(
   "/me",
-  authMiddleware, // ⚠️ 여기 괄호 X, 그냥 함수 이름만!
+  authMiddleware,
   async (req: Request, res: Response) => {
     const userId = (req as any).userId;
 
