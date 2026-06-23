@@ -6,6 +6,7 @@ import { config } from "../core/config";
 import { db } from "../core/db";
 import { createAccessToken } from "../core/jwt";
 import { authMiddleware } from "../middlewares/authMiddleware";
+import { verifyKakaoAccessToken } from "../services/kakao";
 
 const router = Router();
 
@@ -100,6 +101,62 @@ router.post("/google", async (req: Request, res: Response) => {
 
     return res.status(401).json({
       error: "Invalid Google idToken",
+      detail: err?.message,
+    });
+  }
+});
+
+// POST /api/auth/kakao
+router.post("/kakao", async (req: Request, res: Response) => {
+  const { accessToken, platform } = req.body;
+
+  if (!accessToken) {
+    return res.status(400).json({ error: "accessToken is required" });
+  }
+
+  if (!platform) {
+    return res
+      .status(400)
+      .json({ error: "platform(web|android|ios)이 필요합니다." });
+  }
+
+  try {
+    const { kakaoSub, email, name, avatarUrl } =
+      await verifyKakaoAccessToken(accessToken);
+
+    const result = await db.query(
+      `
+      INSERT INTO users (kakao_sub, email, name, avatar_url, last_login_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (kakao_sub)
+      DO UPDATE SET
+        email = COALESCE(EXCLUDED.email, users.email),
+        name = COALESCE(EXCLUDED.name, users.name),
+        avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+        last_login_at = EXCLUDED.last_login_at
+      RETURNING id, email, name, avatar_url;
+    `,
+      [kakaoSub, email, name, avatarUrl]
+    );
+
+    const user = result.rows[0];
+    const jwt = createAccessToken(user.id);
+
+    return res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        avatarUrl: user.avatar_url,
+      },
+      accessToken: jwt,
+      expiresIn: 3600,
+    });
+  } catch (err: any) {
+    console.error("❌ Kakao Login Error:", err?.message || err);
+
+    return res.status(401).json({
+      error: "Invalid Kakao accessToken",
       detail: err?.message,
     });
   }
